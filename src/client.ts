@@ -558,9 +558,12 @@ async function main() {
       return;
     }
     
-    if (path === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      console.log("[OAuth] metadata (RFC8414) GET", { rawPath, effectiveBaseUrl });
-      const metadata = getOAuthMetadata(effectiveBaseUrl);
+    if (path.startsWith("/.well-known/oauth-authorization-server") && req.method === "GET") {
+      const basePath = "/.well-known/oauth-authorization-server";
+      const suffix = path.length > basePath.length ? path.slice(basePath.length) : ""; // e.g. /mcp
+      const issuer = suffix ? `${effectiveBaseUrl}${suffix}` : effectiveBaseUrl;
+      console.log("[OAuth] metadata (RFC8414) GET", { rawPath, path, issuer });
+      const metadata = getOAuthMetadata(issuer);
       res.writeHead(200, { 
         "content-type": "application/json",
         "access-control-allow-origin": "*",
@@ -570,9 +573,12 @@ async function main() {
       return;
     }
     // Also support OpenID configuration for compatibility
-    if (path === "/.well-known/openid-configuration" && req.method === "GET") {
-      console.log("[OIDC] openid-configuration GET", { rawPath, effectiveBaseUrl });
-      const md = getOAuthMetadata(effectiveBaseUrl);
+    if (path.startsWith("/.well-known/openid-configuration") && req.method === "GET") {
+      const basePath = "/.well-known/openid-configuration";
+      const suffix = path.length > basePath.length ? path.slice(basePath.length) : ""; // e.g. /mcp
+      const issuer = suffix ? `${effectiveBaseUrl}${suffix}` : effectiveBaseUrl;
+      console.log("[OIDC] openid-configuration GET", { rawPath, path, issuer });
+      const md = getOAuthMetadata(issuer);
       // Map to OIDC-like fields for clients that probe this
       const oidc = {
         issuer: md.issuer,
@@ -589,6 +595,29 @@ async function main() {
         "cache-control": "public, max-age=3600",
       });
       res.end(JSON.stringify(oidc, null, 2));
+      return;
+    }
+
+    // OAuth 2.0 Protected Resource Metadata (RFC9728)
+    if (path.startsWith("/.well-known/oauth-protected-resource") && req.method === "GET") {
+      const basePath = "/.well-known/oauth-protected-resource";
+      const suffix = path.length > basePath.length ? path.slice(basePath.length) : ""; // e.g. /mcp
+      const issuer = suffix ? `${effectiveBaseUrl}${suffix}` : effectiveBaseUrl;
+      console.log("[PR] protected-resource GET", { rawPath, path, issuer });
+      const authServers = [
+        `${effectiveBaseUrl}`,
+        `${effectiveBaseUrl}/mcp`,
+      ];
+      const pr = {
+        resource: issuer,
+        authorization_servers: Array.from(new Set(authServers)),
+      } as const;
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+        "cache-control": "public, max-age=3600",
+      });
+      res.end(JSON.stringify(pr, null, 2));
       return;
     }
     
