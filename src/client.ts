@@ -506,10 +506,12 @@ async function main() {
   };
 
   // Register OAuth capabilities before connecting to transport
+  const resourcePath = "/mcp";
+  const authMetadataUrl = `${startupBaseUrl}/.well-known/oauth-authorization-server${resourcePath}`;
   mcpServer.server.registerCapabilities({
     experimental: {
       oauth: {
-        authorizationUrl: `${startupBaseUrl}/.well-known/oauth-authorization-server`,
+        authorizationUrl: authMetadataUrl,
         scopes: ["music.library.read", "music.library.write"],
       },
     },
@@ -666,7 +668,22 @@ async function main() {
       }
     }
     
-    if (!req.url || !req.url.startsWith("/mcp")) {
+    // If this is an MCP request without Authorization, return WWW-Authenticate with resource metadata
+    if (rawPath.startsWith("/mcp") && !req.headers.authorization) {
+      const resource = `${effectiveBaseUrl}${resourcePath}`;
+      const resourceMetadata = `${effectiveBaseUrl}/.well-known/oauth-protected-resource${resourcePath}`;
+      const www = `Bearer realm="MCP", resource="${resource}", resource_metadata="${resourceMetadata}"`;
+      console.log("[Auth] 401 WWW-Authenticate for MCP without token", { resource, resourceMetadata });
+      res.writeHead(401, {
+        "www-authenticate": www,
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+      });
+      res.end(JSON.stringify({ error: "unauthorized", resource, resource_metadata: resourceMetadata }));
+      return;
+    }
+
+    if (!req.url || !rawPath.startsWith("/mcp")) {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
