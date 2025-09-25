@@ -1,0 +1,466 @@
+import "dotenv/config";
+import http from "node:http";
+import { randomUUID } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import { AppleMusicAPI } from "./appleMusic/api.js";
+import { createDeveloperTokenProvider, getDeveloperConfigFromEnv, getMusicUserToken, } from "./auth/appleMusicAuth.js";
+// OAuth helpers will be implemented inline in this file for stateless mode
+const serverName = "applemusic-mcp";
+const mcpServer = new McpServer({
+    name: serverName,
+    version: "0.1.0",
+}, {
+    instructions: "Apple Music MCP: authenticate, search catalog, fetch metadata, manage your library and playlists, and fetch Replay.",
+    capabilities: {
+        tools: {},
+        logging: {},
+    },
+});
+// Instantiate Apple Music API with OAuth-aware user token getter
+const getDevToken = createDeveloperTokenProvider();
+const api = new AppleMusicAPI({
+    getDeveloperToken: getDevToken,
+    getUserToken: () => {
+        // First try in-memory token
+        const memToken = getMusicUserToken();
+        if (memToken)
+            return memToken;
+        return undefined;
+    },
+    // Stateless mode: tokens are provided per-request by the client via Authorization header
+});
+// =====================
+// OAuth (stateless) helpers
+// =====================
+function getOAuthMetadata(baseUrl) {
+    return {
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/oauth/authorize`,
+        token_endpoint: `${baseUrl}/oauth/token`,
+        response_types_supported: ["code"],
+        response_modes_supported: ["query", "fragment"],
+        grant_types_supported: ["authorization_code"],
+        token_endpoint_auth_methods_supported: ["none"],
+        code_challenge_methods_supported: ["S256"],
+        scopes_supported: ["music.library.read", "music.library.write"],
+    };
+}
+const handleOAuthAuthorize = async (_req, res, searchParams) => {
+    const redirectUri = searchParams.get("redirect_uri");
+    const state = searchParams.get("state");
+    if (!redirectUri || !state) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Missing redirect_uri or state");
+        return;
+    }
+    // Get developer token for MusicKit JS
+    const developerToken = await getDevToken();
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Apple Music Authorization</title>
+  <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f7; }
+    .container { text-align: center; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 420px; }
+    h1 { font-size: 22px; margin-bottom: 16px; }
+    p { color: #666; margin-bottom: 24px; }
+    button { background: #fc3c44; color: white; border: none; padding: 12px 20px; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #e5353c; }
+    .error { color: #d60017; margin-top: 16px; }
+    .success { color: #28a745; margin-top: 16px; }
+  </style>
+<body>
+  <div class="container">
+    <h1>Connect Apple Music</h1>
+    <p>Authorize access to your Apple Music library.</p>
+    <button id="authBtn" onclick="authorize()">Authorize</button>
+    <div id="status"></div>
+  </div>
+  <script>
+    const redirectUri = ${JSON.stringify(redirectUri)};
+    const state = ${JSON.stringify(state)};
+    const developerToken = ${JSON.stringify(developerToken)};
+
+    async function authorize() {
+      const btn = document.getElementById('authBtn');
+      const status = document.getElementById('status');
+      btn.disabled = true;
+      status.textContent = 'Authorizing...';
+      try {
+        await MusicKit.configure({ developerToken, app: { name: 'Apple Music MCP', build: '1.0.0' } });
+        const music = MusicKit.getInstance();
+        const musicUserToken = await music.authorize();
+
+        status.textContent = 'Authorized. Redirecting...';
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/oauth/callback';
+        const t = document.createElement('input'); t.type='hidden'; t.name='music_user_token'; t.value = musicUserToken; form.appendChild(t);
+        const s = document.createElement('input'); s.type='hidden'; s.name='state'; s.value = state; form.appendChild(s);
+        const r = document.createElement('input'); r.type='hidden'; r.name='redirect_uri'; r.value = redirectUri; form.appendChild(r);
+        document.body.appendChild(form);
+        form.submit();
+      } catch (err) {
+        btn.disabled = false;
+        status.innerHTML = '<span class="error">' + (err?.message || 'Authorization failed') + '</span>';
+      }
+    }
+  </script>
+</body>
+</html>`;
+    res.writeHead(200, { "content-type": "text/html", "cache-control": "no-store" });
+    res.end(html);
+};
+const handleOAuthCallback = async (_req, res, body) => {
+    const params = new URLSearchParams(body);
+    const token = params.get("music_user_token");
+    const state = params.get("state");
+    const redirectUri = params.get("redirect_uri");
+    if (!token || !state || !redirectUri) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Missing parameters");
+        return;
+    }
+    const url = new URL(redirectUri);
+    url.searchParams.set("code", token);
+    url.searchParams.set("state", state);
+    res.writeHead(302, { Location: url.toString(), "cache-control": "no-store" });
+    res.end();
+};
+const handleOAuthToken = async (_req, res, body) => {
+    const params = new URLSearchParams(body);
+    const grantType = params.get("grant_type");
+    const code = params.get("code");
+    if (grantType !== "authorization_code" || !code) {
+        res.writeHead(400, {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+            "access-control-allow-origin": "*",
+        });
+        res.end(JSON.stringify({ error: "invalid_request" }));
+        return;
+    }
+    const response = {
+        access_token: code, // Stateless: client will present this Bearer token on each request
+        token_type: "Bearer",
+        expires_in: 60 * 60 * 24 * 90, // 90 days (hint only; no server-side state)
+        scope: "music.library.read music.library.write",
+    };
+    res.writeHead(200, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "access-control-allow-origin": "*",
+    });
+    res.end(JSON.stringify(response));
+};
+// Auth tools
+mcpServer.registerTool("applemusic.auth.status", {
+    title: "Auth Status",
+    description: "Returns whether developer credentials and user token are set.",
+}, async (_args, extra) => {
+    let devOk = false;
+    try {
+        getDeveloperConfigFromEnv();
+        await getDevToken();
+        devOk = true;
+    }
+    catch { }
+    const inMemoryToken = Boolean(getMusicUserToken());
+    const authHeader = extra?.requestInfo?.headers?.authorization;
+    const bearer = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+    const hasBearer = Boolean(parseBearerToken(bearer));
+    const hasUser = inMemoryToken || hasBearer;
+    return {
+        content: [
+            {
+                type: "text",
+                text: JSON.stringify({
+                    developerConfigured: devOk,
+                    hasMusicUserToken: hasUser,
+                    authSources: {
+                        bearer: hasBearer,
+                        manual: inMemoryToken,
+                    },
+                }, null, 2),
+            },
+        ],
+    };
+});
+// Catalog tools
+const catalogSearchSchema = z.object({
+    term: z.string().min(1),
+    types: z.string().optional().describe("Comma-separated types e.g., songs,albums,artists"),
+    storefront: z.string().optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+});
+mcpServer.registerTool("applemusic.catalog.search", {
+    title: "Catalog Search",
+    description: "Search Apple Music catalog.",
+    inputSchema: catalogSearchSchema.shape,
+}, async (args) => {
+    const data = await api.searchCatalog(args);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const catalogSongSchema = z.object({ id: z.string().min(1), storefront: z.string().optional() });
+mcpServer.registerTool("applemusic.catalog.song", { title: "Get Song", description: "Get catalog song by id.", inputSchema: catalogSongSchema.shape }, async (args) => {
+    const data = await api.getSong(args);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const catalogSongsByIsrcSchema = z.object({ isrc: z.string().min(3), storefront: z.string().optional() });
+mcpServer.registerTool("applemusic.catalog.songs_by_isrc", { title: "Get Songs by ISRC", description: "Find catalog songs by ISRC.", inputSchema: catalogSongsByIsrcSchema.shape }, async (args) => {
+    const data = await api.getSongsByIsrc(args);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+// Library tools
+const listLibrarySongsSchema = z.object({ limit: z.number().int().min(1).max(100).optional(), offset: z.string().optional() });
+mcpServer.registerTool("applemusic.library.songs", { title: "List Library Songs", description: "List user's library songs.", inputSchema: listLibrarySongsSchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.listLibrarySongs(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const searchLibrarySchema = z.object({ term: z.string().min(1), types: z.string().optional(), limit: z.number().int().min(1).max(50).optional() });
+mcpServer.registerTool("applemusic.library.search", { title: "Search Library", description: "Search user's library.", inputSchema: searchLibrarySchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.searchLibrary(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const listPlaylistsSchema = z.object({ limit: z.number().int().min(1).max(100).optional(), offset: z.string().optional() });
+mcpServer.registerTool("applemusic.library.playlists", { title: "List Playlists", description: "List user's library playlists.", inputSchema: listPlaylistsSchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.listLibraryPlaylists(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const playlistTracksSchema = z.object({ id: z.string().min(1), limit: z.number().int().min(1).max(100).optional(), offset: z.string().optional() });
+mcpServer.registerTool("applemusic.library.playlist_tracks", { title: "Playlist Tracks", description: "List tracks in a user's playlist.", inputSchema: playlistTracksSchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.getPlaylistTracks(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const addToLibraryInputShape = {
+    songIds: z.array(z.string()).optional(),
+    albumIds: z.array(z.string()).optional(),
+};
+const addToLibrarySchema = z
+    .object(addToLibraryInputShape)
+    .refine((v) => (v.songIds && v.songIds.length) || (v.albumIds && v.albumIds.length), {
+    message: "Provide songIds or albumIds",
+});
+mcpServer.registerTool("applemusic.library.add", {
+    title: "Add to Library",
+    description: "Add songs or albums to user's library.",
+    inputSchema: addToLibraryInputShape,
+}, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.addToLibrary(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const createPlaylistSchema = z.object({ name: z.string().min(1), description: z.string().optional(), trackIds: z.array(z.string()).optional() });
+mcpServer.registerTool("applemusic.library.playlists.create", { title: "Create Playlist", description: "Create a new playlist in user's library.", inputSchema: createPlaylistSchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.createPlaylist(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+const addTracksSchema = z.object({ playlistId: z.string().min(1), trackIds: z.array(z.string()).min(1) });
+mcpServer.registerTool("applemusic.library.playlists.add_tracks", { title: "Add Tracks to Playlist", description: "Append tracks to a user's playlist.", inputSchema: addTracksSchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.addTracksToPlaylist(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+// Replay
+const replaySchema = z.object({ year: z.number().int().optional() });
+mcpServer.registerTool("applemusic.replay.get", { title: "Get Replay", description: "Fetch Apple Music Replay data for the user.", inputSchema: replaySchema.shape }, async (args, extra) => {
+    const userToken = extractAccessToken(extra);
+    const data = await api.getReplay(args, userToken);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+});
+function parseBearerToken(authHeader) {
+    if (!authHeader)
+        return undefined;
+    const [scheme, value] = authHeader.split(" ");
+    if (!scheme || !value)
+        return undefined;
+    if (scheme.toLowerCase() !== "bearer")
+        return undefined;
+    return value.trim();
+}
+function extractAccessToken(extra) {
+    const authHeader = extra?.requestInfo?.headers?.authorization;
+    if (Array.isArray(authHeader)) {
+        for (const entry of authHeader) {
+            const token = parseBearerToken(entry);
+            if (token)
+                return token;
+        }
+        return undefined;
+    }
+    return parseBearerToken(authHeader ?? undefined);
+}
+async function main() {
+    const port = Number.parseInt(process.env.MCP_PORT ?? "3000", 10);
+    const baseUrl = `http://localhost:${port}`;
+    const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true,
+    });
+    transport.onerror = (error) => {
+        console.error("Transport error:", error);
+    };
+    // Register OAuth capabilities before connecting to transport
+    mcpServer.server.registerCapabilities({
+        experimental: {
+            oauth: {
+                authorizationUrl: `${baseUrl}/.well-known/oauth-authorization-server`,
+                scopes: ["music.library.read", "music.library.write"],
+            },
+        },
+    });
+    await mcpServer.connect(transport);
+    const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url || "/", `http://localhost:${port}`);
+        // Handle OAuth endpoints
+        if (url.pathname === "/oauth/authorize" && req.method === "GET") {
+            try {
+                await handleOAuthAuthorize(req, res, url.searchParams);
+            }
+            catch (error) {
+                console.error("OAuth authorize error:", error);
+                res.writeHead(500, {
+                    "content-type": "text/plain",
+                    "access-control-allow-origin": "*",
+                });
+                res.end("Internal server error");
+            }
+            return;
+        }
+        if (url.pathname === "/oauth/callback" && req.method === "POST") {
+            try {
+                const chunks = [];
+                for await (const chunk of req) {
+                    chunks.push(chunk);
+                }
+                const body = Buffer.concat(chunks).toString("utf8");
+                await handleOAuthCallback(req, res, body);
+            }
+            catch (error) {
+                console.error("OAuth callback error:", error);
+                res.writeHead(500, { "content-type": "text/plain" });
+                res.end("Internal server error");
+            }
+            return;
+        }
+        if (url.pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+            const metadata = getOAuthMetadata(baseUrl);
+            res.writeHead(200, {
+                "content-type": "application/json",
+                "access-control-allow-origin": "*",
+                "cache-control": "public, max-age=3600", // Cache for 1 hour
+            });
+            res.end(JSON.stringify(metadata, null, 2));
+            return;
+        }
+        // Legacy metadata endpoint for backward compatibility
+        if (url.pathname === "/mcp/oauth/metadata" && req.method === "GET") {
+            const metadata = getOAuthMetadata(baseUrl);
+            res.writeHead(200, {
+                "content-type": "application/json",
+                "access-control-allow-origin": "*",
+            });
+            res.end(JSON.stringify(metadata, null, 2));
+            return;
+        }
+        if (url.pathname === "/oauth/token") {
+            if (req.method === "OPTIONS") {
+                res.writeHead(204, {
+                    "access-control-allow-origin": "*",
+                    "access-control-allow-headers": "content-type, authorization",
+                    "access-control-allow-methods": "POST, OPTIONS",
+                    "access-control-max-age": "86400",
+                });
+                res.end();
+                return;
+            }
+            if (req.method === "POST") {
+                try {
+                    const chunks = [];
+                    for await (const chunk of req) {
+                        chunks.push(chunk);
+                    }
+                    const body = Buffer.concat(chunks).toString("utf8");
+                    await handleOAuthToken(req, res, body);
+                }
+                catch (error) {
+                    console.error("OAuth token error:", error);
+                    res.writeHead(500, {
+                        "content-type": "application/json",
+                        "access-control-allow-origin": "*",
+                        "cache-control": "no-store",
+                    });
+                    res.end(JSON.stringify({ error: "server_error" }));
+                }
+                return;
+            }
+        }
+        if (!req.url || !req.url.startsWith("/mcp")) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                jsonrpc: "2.0",
+                error: {
+                    code: -32601,
+                    message: "Not Found",
+                },
+                id: null,
+            }));
+            return;
+        }
+        if (req.method === "OPTIONS") {
+            res.writeHead(204, {
+                "access-control-allow-origin": "*",
+                "access-control-allow-headers": "content-type, mcp-session-id",
+                "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+            });
+            res.end();
+            return;
+        }
+        if (req.method !== "GET") {
+            res.setHeader("access-control-allow-origin", "*");
+            res.setHeader("access-control-expose-headers", "mcp-session-id");
+        }
+        try {
+            let parsedBody;
+            if (req.method === "POST") {
+                const chunks = [];
+                for await (const chunk of req) {
+                    chunks.push(chunk);
+                }
+                const rawBody = Buffer.concat(chunks).toString("utf8");
+                parsedBody = rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
+            }
+            await transport.handleRequest(req, res, parsedBody);
+        }
+        catch (error) {
+            console.error("HTTP request handling error:", error);
+            if (!res.headersSent) {
+                res.writeHead(500, { "content-type": "application/json" });
+            }
+            res.end(JSON.stringify({
+                jsonrpc: "2.0",
+                error: {
+                    code: -32000,
+                    message: "Internal server error",
+                },
+                id: null,
+            }));
+        }
+    });
+    server.listen(port, () => {
+        console.log(`MCP server is listening on http://localhost:${port}/mcp`);
+    });
+}
+main().catch((error) => {
+    console.error("Fatal error in MCP server:", error);
+    process.exitCode = 1;
+});
