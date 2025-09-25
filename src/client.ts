@@ -476,9 +476,25 @@ function resolveSessionId(extra?: {
   return getSessionIdFromHeaders(extra?.requestInfo?.headers);
 }
 
+function getBaseUrlFromReq(req: http.IncomingMessage, fallbackPort: number): string {
+  const forwardedProto = (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0]?.trim();
+  const proto = forwardedProto || (req.headers["x-forwarded-proto"] ? "https" : "http");
+  const forwardedHost = req.headers["x-forwarded-host"] as string | undefined;
+  const host = forwardedHost || (req.headers.host ?? `localhost:${fallbackPort}`);
+  return `${proto}://${host}`;
+}
+
+function stripMcpPrefix(pathname: string): string {
+  return pathname.startsWith("/mcp/") ? pathname.slice(4) : pathname;
+}
+
 async function main() {
   const port = Number.parseInt(process.env.MCP_PORT ?? "3000", 10);
-  const baseUrl = `http://localhost:${port}`;
+  const envBaseUrl = process.env.MCP_BASE_URL;
+  const startupBaseUrl = envBaseUrl ?? `http://localhost:${port}`;
+  console.log("[Startup] MCP_PORT=", port);
+  console.log("[Startup] MCP_BASE_URL=", envBaseUrl ?? "<not set>");
+  console.log("[Startup] base URL (capabilities)", startupBaseUrl);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
@@ -493,7 +509,7 @@ async function main() {
   mcpServer.server.registerCapabilities({
     experimental: {
       oauth: {
-        authorizationUrl: `${baseUrl}/.well-known/oauth-authorization-server`,
+        authorizationUrl: `${startupBaseUrl}/.well-known/oauth-authorization-server`,
         scopes: ["music.library.read", "music.library.write"],
       },
     },
@@ -502,11 +518,17 @@ async function main() {
   await mcpServer.connect(transport);
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || "/", `http://localhost:${port}`);
+    const reqBase = getBaseUrlFromReq(req, port);
+    const url = new URL(req.url || "/", reqBase);
+    const effectiveBaseUrl = process.env.MCP_BASE_URL ?? reqBase;
+    const rawPath = url.pathname;
+    const path = stripMcpPrefix(rawPath);
+    console.log("[HTTP]", req.method, rawPath, "=> path:", path, "base:", effectiveBaseUrl);
     
-    // Handle OAuth endpoints
-    if (url.pathname === "/oauth/authorize" && req.method === "GET") {
+    // Handle OAuth endpoints (support both root and /mcp/ prefixed)
+    if (path === "/oauth/authorize" && req.method === "GET") {
       try {
+        console.log("[OAuth] authorize GET", { rawPath, base: effectiveBaseUrl });
         await handleOAuthAuthorize(req, res, url.searchParams);
       } catch (error) {
         console.error("OAuth authorize error:", error);
@@ -519,8 +541,9 @@ async function main() {
       return;
     }
     
-    if (url.pathname === "/oauth/callback" && req.method === "POST") {
+    if (path === "/oauth/callback" && req.method === "POST") {
       try {
+        console.log("[OAuth] callback POST", { rawPath });
         const chunks: Buffer[] = [];
         for await (const chunk of req) {
           chunks.push(chunk as Buffer);
@@ -535,8 +558,9 @@ async function main() {
       return;
     }
     
-    if (url.pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      const metadata = getOAuthMetadata(baseUrl);
+    if (path === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      console.log("[OAuth] metadata (RFC8414) GET", { rawPath, effectiveBaseUrl });
+      const metadata = getOAuthMetadata(effectiveBaseUrl);
       res.writeHead(200, { 
         "content-type": "application/json",
         "access-control-allow-origin": "*",
@@ -545,10 +569,32 @@ async function main() {
       res.end(JSON.stringify(metadata, null, 2));
       return;
     }
+    // Also support OpenID configuration for compatibility
+    if (path === "/.well-known/openid-configuration" && req.method === "GET") {
+      console.log("[OIDC] openid-configuration GET", { rawPath, effectiveBaseUrl });
+      const md = getOAuthMetadata(effectiveBaseUrl);
+      // Map to OIDC-like fields for clients that probe this
+      const oidc = {
+        issuer: md.issuer,
+        authorization_endpoint: md.authorization_endpoint,
+        token_endpoint: md.token_endpoint,
+        response_types_supported: md.response_types_supported,
+        grant_types_supported: md.grant_types_supported,
+        code_challenge_methods_supported: md.code_challenge_methods_supported,
+        scopes_supported: md.scopes_supported,
+      };
+      res.writeHead(200, { 
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+        "cache-control": "public, max-age=3600",
+      });
+      res.end(JSON.stringify(oidc, null, 2));
+      return;
+    }
     
     // Legacy metadata endpoint for backward compatibility
-    if (url.pathname === "/mcp/oauth/metadata" && req.method === "GET") {
-      const metadata = getOAuthMetadata(baseUrl);
+    if (path === "/mcp/oauth/metadata" && req.method === "GET") {
+      const metadata = getOAuthMetadata(effectiveBaseUrl);
       res.writeHead(200, { 
         "content-type": "application/json",
         "access-control-allow-origin": "*",
@@ -557,7 +603,7 @@ async function main() {
       return;
     }
     
-    if (url.pathname === "/oauth/token") {
+    if (path === "/oauth/token") {
       if (req.method === "OPTIONS") {
         res.writeHead(204, {
           "access-control-allow-origin": "*",
@@ -571,6 +617,7 @@ async function main() {
       
       if (req.method === "POST") {
         try {
+          console.log("[OAuth] token POST", { rawPath });
           const chunks: Buffer[] = [];
           for await (const chunk of req) {
             chunks.push(chunk as Buffer);
